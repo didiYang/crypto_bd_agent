@@ -12,7 +12,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { ChevronDown } from "lucide-react";
 import { toast } from "sonner";
-import { useState } from "react";
+import { useState, useEffect, useRef } from "react";
 import ScanResultDialog, { type DiscoveredProject } from "@/components/ScanResultDialog";
 import {
   AreaChart,
@@ -37,6 +37,48 @@ export default function Dashboard() {
   const [scanDialogOpen, setScanDialogOpen] = useState(false);
   const [scanResults, setScanResults] = useState<DiscoveredProject[]>([]);
   const [lastScanDays, setLastScanDays] = useState(1);
+  // SSE scan progress
+  const [scanProgress, setScanProgress] = useState<{
+    page: number;
+    totalPages: number;
+    found: number;
+    latestProject: string;
+  } | null>(null);
+  const [updatedCount, setUpdatedCount] = useState(0);
+  const sseRef = useRef<EventSource | null>(null);
+
+  // Subscribe to SSE scan progress when discovering
+  useEffect(() => {
+    if (!discovering) {
+      setScanProgress(null);
+      return;
+    }
+    const es = new EventSource("/api/scan-progress");
+    sseRef.current = es;
+    es.onmessage = (e) => {
+      try {
+        const event = JSON.parse(e.data);
+        if (event.type === "page") {
+          setScanProgress(prev => ({
+            page: event.page,
+            totalPages: event.totalPages,
+            found: event.total,
+            latestProject: prev?.latestProject || "",
+          }));
+        } else if (event.type === "project" && event.isNew) {
+          setScanProgress(prev => prev ? {
+            ...prev,
+            found: prev.found,
+            latestProject: `${event.name} (${event.symbol})`,
+          } : null);
+        } else if (event.type === "done") {
+          setUpdatedCount(event.updatedCount || 0);
+          es.close();
+        }
+      } catch {}
+    };
+    return () => { es.close(); sseRef.current = null; };
+  }, [discovering]);
 
   const SCAN_PERIOD_LABELS: Record<number, string> = {
     1: "过去24小时 / Last 24h",
@@ -59,9 +101,17 @@ export default function Dashboard() {
         setScanResults(data.projects);
         setLastScanDays(data.daysBack);
         setScanDialogOpen(true);
+        if ((data as any).updatedCount > 0) {
+          toast.info(`已更新 ${(data as any).updatedCount} 个已有项目的市值和联系渠道`);
+        }
       } else {
         const periodLabel = SCAN_PERIOD_LABELS[data.daysBack] || `Last ${data.daysBack} days`;
-        toast.info(`未发现新项目，该时段内项目已全部入库（${periodLabel}）`);
+        const updated = (data as any).updatedCount || 0;
+        if (updated > 0) {
+          toast.success(`未发现新项目，已更新 ${updated} 个已有项目的市值和联系渠道`);
+        } else {
+          toast.info(`未发现新项目，该时段内项目已全部入库（${periodLabel}）`);
+        }
       }
     },
     onError: (e) => toast.error(e.message),
@@ -119,6 +169,7 @@ export default function Dashboard() {
           >
             {autoFollowUpMutation.isPending ? "处理中..." : `⏰ 自动跟进 (${followUpProjects?.length || 0})`}
           </Button>
+          <div className="flex flex-col gap-1">
           <div className="flex items-center">
             <Button
               size="sm"
@@ -129,7 +180,11 @@ export default function Dashboard() {
               disabled={discovering}
               className="bg-primary hover:bg-primary/90 rounded-r-none border-r border-primary/60"
             >
-              {discovering ? "扫描中..." : `🔍 扫描新项目`}
+              {discovering
+                ? scanProgress
+                  ? `扫描第 ${scanProgress.page}/${scanProgress.totalPages} 页...`
+                  : "连接中..."
+                : `🔍 扫描新项目`}
             </Button>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -156,6 +211,32 @@ export default function Dashboard() {
                 ))}
               </DropdownMenuContent>
             </DropdownMenu>
+          </div>
+          {/* Progress bar */}
+          {discovering && (
+            <div className="w-full">
+              <div className="h-1 bg-muted rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-primary transition-all duration-500"
+                  style={{
+                    width: scanProgress
+                      ? `${Math.round((scanProgress.page / scanProgress.totalPages) * 100)}%`
+                      : "5%",
+                  }}
+                />
+              </div>
+              {scanProgress?.latestProject && (
+                <p className="text-xs text-muted-foreground mt-0.5 truncate max-w-[280px]">
+                  ✨ {scanProgress.latestProject}
+                </p>
+              )}
+              {scanProgress && (
+                <p className="text-xs text-muted-foreground">
+                  已发现 {scanProgress.found} 个新项目
+                </p>
+              )}
+            </div>
+          )}
           </div>
         </div>
       </div>

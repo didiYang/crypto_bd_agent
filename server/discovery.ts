@@ -7,10 +7,13 @@
  *   - Use ath_date as a proxy for "listing date" — new coins typically hit ATH soon after listing
  *   - Scan multiple pages to maximize coverage
  *   - Also fetch coin detail for contact links (Twitter, Telegram, Discord, website)
+ *   - Emit SSE progress events for real-time frontend updates
+ *   - Update existing projects' market data and contact info instead of skipping
  */
 
 import axios from "axios";
-import { createProject, getProjectBySourceId, updateAnalytics, getOrCreateAnalytics } from "./db";
+import { createProject, getProjectBySourceId, updateAnalytics, getOrCreateAnalytics, updateProject } from "./db";
+import { emitScanProgress } from "./scanProgress";
 
 // Meme-related keywords for classification
 const MEME_KEYWORDS = [
@@ -52,14 +55,19 @@ export type DiscoveredProject = {
 };
 
 // ─── CoinGecko Discovery (Free API) ──────────────────────────────────────────
-export async function discoverFromCoinGecko(limit = 50, daysBack = 1): Promise<DiscoveredProject[]> {
+export async function discoverFromCoinGecko(limit = 50, daysBack = 1): Promise<{
+  newProjects: DiscoveredProject[];
+  updatedCount: number;
+}> {
   const newProjects: DiscoveredProject[] = [];
+  let updatedCount = 0;
   const cutoffTime = Date.now() - daysBack * 24 * 60 * 60 * 1000;
   // Scan more pages for longer time windows
   const pagesToScan = Math.min(Math.ceil(daysBack * 2), 8);
-  const perPage = 250;
 
   console.log(`[CoinGecko] Scanning ${pagesToScan} pages for projects in last ${daysBack} day(s)...`);
+
+  emitScanProgress({ type: "start", totalPages: pagesToScan, daysBack });
 
   for (let page = 1; page <= pagesToScan; page++) {
     try {
@@ -70,7 +78,7 @@ export async function discoverFromCoinGecko(limit = 50, daysBack = 1): Promise<D
         params: {
           vs_currency: "usd",
           order: "market_cap_asc",
-          per_page: perPage,
+          per_page: 250,
           page,
           sparkline: false,
         },
@@ -79,10 +87,12 @@ export async function discoverFromCoinGecko(limit = 50, daysBack = 1): Promise<D
       const coins: any[] = Array.isArray(response.data) ? response.data : [];
       if (coins.length === 0) {
         console.warn(`[CoinGecko] Page ${page}: empty or rate-limited response, stopping`);
+        emitScanProgress({ type: "page", page, totalPages: pagesToScan, found: 0, total: newProjects.length });
         break;
       }
       console.log(`[CoinGecko] Page ${page}: got ${coins.length} coins`);
 
+      let pageFound = 0;
       for (const coin of coins) {
         // Use ath_date as listing date proxy — new coins hit ATH shortly after listing
         const athDate = coin.ath_date;
@@ -92,9 +102,8 @@ export async function discoverFromCoinGecko(limit = 50, daysBack = 1): Promise<D
         // Only include coins whose ATH is within the requested time window
         if (athTime < cutoffTime) continue;
 
-        // Skip if already in DB
+        // Check if already in DB
         const existing = await getProjectBySourceId(coin.id, "coingecko");
-        if (existing) continue;
 
         // Fetch detailed info for contact links
         let detail: any = null;
@@ -114,22 +123,43 @@ export async function discoverFromCoinGecko(limit = 50, daysBack = 1): Promise<D
           await new Promise((r) => setTimeout(r, 2100));
         } catch (err: any) {
           console.warn(`[CoinGecko] Detail fetch failed for ${coin.id}: ${err.message}`);
-          // Still save with basic info even without detail
         }
 
         const categories: string[] = detail?.categories || [];
-        const isMeme = isMemeProject(
-          coin.name,
-          coin.symbol,
-          categories.join(","),
-          categories
-        );
-
+        const isMeme = isMemeProject(coin.name, coin.symbol, categories.join(","), categories);
         const twitterHandle = detail?.links?.twitter_screen_name || null;
         const telegramId = detail?.links?.telegram_channel_identifier || null;
         const discordUrl = detail?.links?.chat_url?.find((u: string) => u?.includes("discord")) || null;
         const homepage = detail?.links?.homepage?.[0] || null;
 
+        if (existing) {
+          // ── Update existing project: refresh market data and contact info ──
+          const updateData: Record<string, any> = {
+            marketCap: coin.market_cap?.toString() || existing.marketCap,
+            price: coin.current_price?.toString() || existing.price,
+            volume24h: coin.total_volume?.toString() || existing.volume24h,
+          };
+          // Only update contact fields if we got new (non-empty) values
+          if (twitterHandle && !existing.twitterHandle) {
+            updateData.twitterHandle = twitterHandle;
+            updateData.twitterUrl = `https://twitter.com/${twitterHandle}`;
+          }
+          if (telegramId && !existing.telegramUrl) {
+            updateData.telegramUrl = `https://t.me/${telegramId}`;
+          }
+          if (discordUrl && !existing.discordUrl) {
+            updateData.discordUrl = discordUrl;
+          }
+          if (homepage && !existing.website) {
+            updateData.website = homepage;
+          }
+          await updateProject(existing.id, updateData);
+          updatedCount++;
+          emitScanProgress({ type: "project", name: coin.name, symbol: coin.symbol, isMeme, isNew: false });
+          continue;
+        }
+
+        // ── New project: create and add to results ──
         try {
           const saved = await createProject({
             name: coin.name,
@@ -170,7 +200,9 @@ export async function discoverFromCoinGecko(limit = 50, daysBack = 1): Promise<D
             category: saved.category ?? null,
           });
 
-          console.log(`[CoinGecko] Saved: ${coin.name} (${coin.symbol}) isMeme=${isMeme} ath=${athDate}`);
+          pageFound++;
+          emitScanProgress({ type: "project", name: coin.name, symbol: coin.symbol, isMeme, isNew: true });
+          console.log(`[CoinGecko] New: ${coin.name} (${coin.symbol}) isMeme=${isMeme}`);
         } catch (err: any) {
           console.warn(`[CoinGecko] Failed to save ${coin.id}: ${err.message}`);
         }
@@ -179,12 +211,15 @@ export async function discoverFromCoinGecko(limit = 50, daysBack = 1): Promise<D
         if (newProjects.length >= limit) break;
       }
 
+      emitScanProgress({ type: "page", page, totalPages: pagesToScan, found: pageFound, total: newProjects.length });
+
       if (newProjects.length >= limit) break;
 
       // Small pause between pages
       await new Promise((r) => setTimeout(r, 1500));
     } catch (err: any) {
       console.error(`[CoinGecko] Page ${page} failed: ${err.message}`);
+      emitScanProgress({ type: "page", page, totalPages: pagesToScan, found: 0, total: newProjects.length });
       break;
     }
   }
@@ -198,15 +233,19 @@ export async function discoverFromCoinGecko(limit = 50, daysBack = 1): Promise<D
     });
   }
 
-  console.log(`[CoinGecko] Total discovered: ${newProjects.length} new projects`);
-  return newProjects;
+  emitScanProgress({ type: "done", total: newProjects.length + updatedCount, newCount: newProjects.length, updatedCount, daysBack });
+  console.log(`[CoinGecko] Done: ${newProjects.length} new, ${updatedCount} updated`);
+  return { newProjects, updatedCount };
 }
 
 // ─── CoinMarketCap Discovery ──────────────────────────────────────────────────
-export async function discoverFromCoinMarketCap(apiKey?: string, limit = 50, daysBack = 1): Promise<DiscoveredProject[]> {
+export async function discoverFromCoinMarketCap(apiKey?: string, limit = 50, daysBack = 1): Promise<{
+  newProjects: DiscoveredProject[];
+  updatedCount: number;
+}> {
   if (!apiKey) {
     console.warn("[CMC] No API key provided, skipping CMC discovery");
-    return [];
+    return { newProjects: [], updatedCount: 0 };
   }
 
   try {
@@ -227,20 +266,32 @@ export async function discoverFromCoinMarketCap(apiKey?: string, limit = 50, day
 
     const coins = response.data?.data || [];
     const newProjects: DiscoveredProject[] = [];
+    let updatedCount = 0;
 
     for (const coin of coins) {
+      const tags = coin.tags || [];
+      const isMeme = isMemeProject(coin.name, coin.symbol, coin.category, tags);
+
+      // Time filter: skip coins added before the cutoff window
+      if (coin.date_added && new Date(coin.date_added).getTime() < cutoffTime) {
+        continue;
+      }
+
+      const existing = await getProjectBySourceId(String(coin.id), "coinmarketcap");
+
+      if (existing) {
+        // Update market data for existing projects
+        await updateProject(existing.id, {
+          marketCap: coin.quote?.USD?.market_cap?.toString() || existing.marketCap,
+          price: coin.quote?.USD?.price?.toString() || existing.price,
+          volume24h: coin.quote?.USD?.volume_24h?.toString() || existing.volume24h,
+        });
+        updatedCount++;
+        emitScanProgress({ type: "project", name: coin.name, symbol: coin.symbol, isMeme, isNew: false });
+        continue;
+      }
+
       try {
-        const existing = await getProjectBySourceId(String(coin.id), "coinmarketcap");
-        if (existing) continue;
-
-        const tags = coin.tags || [];
-        const isMeme = isMemeProject(coin.name, coin.symbol, coin.category, tags);
-
-        // Time filter: skip coins added before the cutoff window
-        if (coin.date_added && new Date(coin.date_added).getTime() < cutoffTime) {
-          continue;
-        }
-
         const saved = await createProject({
           name: coin.name,
           symbol: coin.symbol,
@@ -273,6 +324,7 @@ export async function discoverFromCoinMarketCap(apiKey?: string, limit = 50, day
           source: saved.source,
           category: saved.category ?? null,
         });
+        emitScanProgress({ type: "project", name: coin.name, symbol: coin.symbol, isMeme, isNew: true });
       } catch (err: any) {
         console.warn(`[CMC] Failed to save coin ${coin.id}:`, err.message);
       }
@@ -286,11 +338,11 @@ export async function discoverFromCoinMarketCap(apiKey?: string, limit = 50, day
       });
     }
 
-    console.log(`[CMC] Discovered ${newProjects.length} new projects`);
-    return newProjects;
+    console.log(`[CMC] Done: ${newProjects.length} new, ${updatedCount} updated`);
+    return { newProjects, updatedCount };
   } catch (err: any) {
     console.error("[CMC] Discovery failed:", err.message);
-    return [];
+    return { newProjects: [], updatedCount: 0 };
   }
 }
 
