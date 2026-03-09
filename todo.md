@@ -64,3 +64,8 @@
 ## 新需求 / New Requirements (Round 2)
 
 - [x] 扫描完成后弹窗展示新发现项目列表，支持多选和一键批量首次联系
+
+## Bug修复 / Bug Fixes
+
+- [x] 修复CoinGecko扫描无法发现新项目的问题：/coins/list/new 是付费端点，改用免费的 /coins/markets 并以 ath_date 作为新上线时间代理
+- [x] 修复API速率限制时的崩溃问题：增加非数组响应检测，自动停止翻页

@@ -1,7 +1,12 @@
 /**
  * Project Discovery Service
- * Fetches new crypto projects from CoinMarketCap and CoinGecko
- * Identifies meme coins and extracts contact information
+ * Fetches new crypto projects from CoinMarketCap and CoinGecko (free tier)
+ *
+ * CoinGecko Free API Strategy:
+ *   - /coins/markets (sorted by market_cap_asc to surface newer/smaller coins)
+ *   - Use ath_date as a proxy for "listing date" — new coins typically hit ATH soon after listing
+ *   - Scan multiple pages to maximize coverage
+ *   - Also fetch coin detail for contact links (Twitter, Telegram, Discord, website)
  */
 
 import axios from "axios";
@@ -11,10 +16,11 @@ import { createProject, getProjectBySourceId, updateAnalytics, getOrCreateAnalyt
 const MEME_KEYWORDS = [
   "meme", "doge", "shib", "pepe", "floki", "inu", "cat", "dog", "frog",
   "moon", "elon", "safe", "baby", "mini", "chad", "wojak", "bonk",
-  "wif", "popcat", "neiro", "mog", "brett", "toshi", "turbo",
+  "wif", "popcat", "neiro", "mog", "brett", "toshi", "turbo", "gib",
+  "pnut", "goat", "act", "fwog", "retardio", "sigma", "skibidi",
 ];
 
-const MEME_CATEGORIES = ["memes", "meme-token", "dog-themed-coins", "cat-themed-coins"];
+const MEME_CATEGORIES = ["memes", "meme-token", "dog-themed-coins", "cat-themed-coins", "meme-coins"];
 
 function isMemeProject(name: string, symbol: string, category?: string, tags?: string[]): boolean {
   const lowerName = name.toLowerCase();
@@ -28,7 +34,7 @@ function isMemeProject(name: string, symbol: string, category?: string, tags?: s
   return false;
 }
 
-// ─── CoinGecko Discovery ──────────────────────────────────────────────────────
+// ─── Types ────────────────────────────────────────────────────────────────────
 export type DiscoveredProject = {
   id: number;
   name: string;
@@ -45,122 +51,155 @@ export type DiscoveredProject = {
   category: string | null;
 };
 
+// ─── CoinGecko Discovery (Free API) ──────────────────────────────────────────
 export async function discoverFromCoinGecko(limit = 50, daysBack = 1): Promise<DiscoveredProject[]> {
-  try {
-    // Get recently added coins
-    const response = await axios.get("https://api.coingecko.com/api/v3/coins/list/new", {
-      timeout: 15000,
-      headers: { "Accept": "application/json" },
-    });
+  const newProjects: DiscoveredProject[] = [];
+  const cutoffTime = Date.now() - daysBack * 24 * 60 * 60 * 1000;
+  // Scan more pages for longer time windows
+  const pagesToScan = Math.min(Math.ceil(daysBack * 2), 8);
+  const perPage = 250;
 
-    // Filter by time window: daysBack controls how far back we look
-    const cutoffTime = Date.now() - daysBack * 24 * 60 * 60 * 1000;
-    // CoinGecko /coins/list/new returns coins sorted by activation time desc
-    // We take up to `limit` but will also apply time-based filtering on detail fetch
-    const coins = response.data?.slice(0, Math.min(limit * daysBack, 200)) || [];
-    const newProjects: DiscoveredProject[] = [];
+  console.log(`[CoinGecko] Scanning ${pagesToScan} pages for projects in last ${daysBack} day(s)...`);
 
-    for (const coin of coins) {
-      try {
+  for (let page = 1; page <= pagesToScan; page++) {
+    try {
+      // Use market_cap_asc to surface newer/smaller coins first
+      const response = await axios.get("https://api.coingecko.com/api/v3/coins/markets", {
+        timeout: 15000,
+        headers: { "Accept": "application/json" },
+        params: {
+          vs_currency: "usd",
+          order: "market_cap_asc",
+          per_page: perPage,
+          page,
+          sparkline: false,
+        },
+      });
+
+      const coins: any[] = Array.isArray(response.data) ? response.data : [];
+      if (coins.length === 0) {
+        console.warn(`[CoinGecko] Page ${page}: empty or rate-limited response, stopping`);
+        break;
+      }
+      console.log(`[CoinGecko] Page ${page}: got ${coins.length} coins`);
+
+      for (const coin of coins) {
+        // Use ath_date as listing date proxy — new coins hit ATH shortly after listing
+        const athDate = coin.ath_date;
+        if (!athDate) continue;
+
+        const athTime = new Date(athDate).getTime();
+        // Only include coins whose ATH is within the requested time window
+        if (athTime < cutoffTime) continue;
+
+        // Skip if already in DB
         const existing = await getProjectBySourceId(coin.id, "coingecko");
         if (existing) continue;
 
-        // Fetch detailed info
-        const detail = await axios.get(`https://api.coingecko.com/api/v3/coins/${coin.id}`, {
-          timeout: 10000,
-          params: {
-            localization: false,
-            tickers: false,
-            market_data: true,
-            community_data: false,
-            developer_data: false,
-          },
-        });
-
-        const d = detail.data;
-        const categories = d.categories || [];
-        const isMeme = isMemeProject(d.name, d.symbol, categories.join(","), categories);
-
-        // Time filter: skip coins added before the cutoff window
-        const activatedAt = d.genesis_date
-          ? new Date(d.genesis_date).getTime()
-          : (d.market_data?.atl_date?.usd ? new Date(d.market_data.atl_date.usd).getTime() : Date.now());
-        // Use market_data.last_updated as a proxy for listing time if genesis_date not available
-        const listingTime = d.market_data?.last_updated
-          ? new Date(d.market_data.last_updated).getTime()
-          : Date.now();
-        // Only skip if we have a reliable date AND it's clearly outside the window
-        // (genesis_date is often null for new coins, so we don't skip when date is unknown)
-        if (d.genesis_date && new Date(d.genesis_date).getTime() < cutoffTime) {
-          continue;
+        // Fetch detailed info for contact links
+        let detail: any = null;
+        try {
+          const detailRes = await axios.get(`https://api.coingecko.com/api/v3/coins/${coin.id}`, {
+            timeout: 10000,
+            params: {
+              localization: false,
+              tickers: false,
+              market_data: false,
+              community_data: false,
+              developer_data: false,
+            },
+          });
+          detail = detailRes.data;
+          // Rate limit: CoinGecko free tier allows ~30 req/min
+          await new Promise((r) => setTimeout(r, 2100));
+        } catch (err: any) {
+          console.warn(`[CoinGecko] Detail fetch failed for ${coin.id}: ${err.message}`);
+          // Still save with basic info even without detail
         }
 
-        const saved = await createProject({
-          name: d.name,
-          symbol: d.symbol?.toUpperCase(),
-          slug: d.id,
-          description: d.description?.en?.slice(0, 1000),
-          logoUrl: d.image?.large,
-          source: "coingecko",
-          sourceId: d.id,
-          isMeme,
-          category: categories[0] || null,
-          website: d.links?.homepage?.[0] || null,
-          twitterHandle: d.links?.twitter_screen_name || null,
-          twitterUrl: d.links?.twitter_screen_name
-            ? `https://twitter.com/${d.links.twitter_screen_name}`
-            : null,
-          telegramUrl: d.links?.telegram_channel_identifier
-            ? `https://t.me/${d.links.telegram_channel_identifier}`
-            : null,
-          discordUrl: d.links?.chat_url?.find((u: string) => u.includes("discord")) || null,
-          marketCap: d.market_data?.market_cap?.usd?.toString() || null,
-          price: d.market_data?.current_price?.usd?.toString() || null,
-          volume24h: d.market_data?.total_volume?.usd?.toString() || null,
-          chain: d.asset_platform_id || null,
-          contractAddress: d.contract_address || null,
-          status: "discovered",
-          priority: isMeme ? "high" : "medium",
-          listedOnSourceAt: new Date(),
-        });
+        const categories: string[] = detail?.categories || [];
+        const isMeme = isMemeProject(
+          coin.name,
+          coin.symbol,
+          categories.join(","),
+          categories
+        );
 
-        newProjects.push({
-          id: saved.id,
-          name: saved.name,
-          symbol: saved.symbol,
-          isMeme: saved.isMeme,
-          logoUrl: saved.logoUrl ?? null,
-          twitterUrl: saved.twitterUrl ?? null,
-          telegramUrl: saved.telegramUrl ?? null,
-          discordUrl: saved.discordUrl ?? null,
-          officialEmail: saved.officialEmail ?? null,
-          website: saved.website ?? null,
-          marketCap: saved.marketCap ?? null,
-          source: saved.source,
-          category: saved.category ?? null,
-        });
-        // Rate limit: 30 req/min for free tier
-        await new Promise((r) => setTimeout(r, 2000));
-      } catch (err: any) {
-        console.warn(`[CoinGecko] Failed to fetch details for ${coin.id}:`, err.message);
+        const twitterHandle = detail?.links?.twitter_screen_name || null;
+        const telegramId = detail?.links?.telegram_channel_identifier || null;
+        const discordUrl = detail?.links?.chat_url?.find((u: string) => u?.includes("discord")) || null;
+        const homepage = detail?.links?.homepage?.[0] || null;
+
+        try {
+          const saved = await createProject({
+            name: coin.name,
+            symbol: coin.symbol?.toUpperCase(),
+            slug: coin.id,
+            description: detail?.description?.en?.slice(0, 1000) || null,
+            logoUrl: coin.image || null,
+            source: "coingecko",
+            sourceId: coin.id,
+            isMeme,
+            category: categories[0] || null,
+            website: homepage,
+            twitterHandle,
+            twitterUrl: twitterHandle ? `https://twitter.com/${twitterHandle}` : null,
+            telegramUrl: telegramId ? `https://t.me/${telegramId}` : null,
+            discordUrl: discordUrl || null,
+            marketCap: coin.market_cap?.toString() || null,
+            price: coin.current_price?.toString() || null,
+            volume24h: coin.total_volume?.toString() || null,
+            status: "discovered",
+            priority: isMeme ? "high" : "medium",
+            listedOnSourceAt: athDate ? new Date(athDate) : new Date(),
+          });
+
+          newProjects.push({
+            id: saved.id,
+            name: saved.name,
+            symbol: saved.symbol,
+            isMeme: saved.isMeme,
+            logoUrl: saved.logoUrl ?? null,
+            twitterUrl: saved.twitterUrl ?? null,
+            telegramUrl: saved.telegramUrl ?? null,
+            discordUrl: saved.discordUrl ?? null,
+            officialEmail: saved.officialEmail ?? null,
+            website: saved.website ?? null,
+            marketCap: saved.marketCap ?? null,
+            source: saved.source,
+            category: saved.category ?? null,
+          });
+
+          console.log(`[CoinGecko] Saved: ${coin.name} (${coin.symbol}) isMeme=${isMeme} ath=${athDate}`);
+        } catch (err: any) {
+          console.warn(`[CoinGecko] Failed to save ${coin.id}: ${err.message}`);
+        }
+
+        // Stop if we've hit the limit
+        if (newProjects.length >= limit) break;
       }
-    }
 
-    // Update analytics
-    if (newProjects.length > 0) {
-      const today = new Date().toISOString().slice(0, 10);
-      const row = await getOrCreateAnalytics(today);
-      await updateAnalytics(today, {
-        projectsDiscovered: (row.projectsDiscovered || 0) + newProjects.length,
-      });
-    }
+      if (newProjects.length >= limit) break;
 
-    console.log(`[CoinGecko] Discovered ${newProjects.length} new projects`);
-    return newProjects;
-  } catch (err: any) {
-    console.error("[CoinGecko] Discovery failed:", err.message);
-    return [];
+      // Small pause between pages
+      await new Promise((r) => setTimeout(r, 1500));
+    } catch (err: any) {
+      console.error(`[CoinGecko] Page ${page} failed: ${err.message}`);
+      break;
+    }
   }
+
+  // Update analytics
+  if (newProjects.length > 0) {
+    const today = new Date().toISOString().slice(0, 10);
+    const row = await getOrCreateAnalytics(today);
+    await updateAnalytics(today, {
+      projectsDiscovered: (row.projectsDiscovered || 0) + newProjects.length,
+    });
+  }
+
+  console.log(`[CoinGecko] Total discovered: ${newProjects.length} new projects`);
+  return newProjects;
 }
 
 // ─── CoinMarketCap Discovery ──────────────────────────────────────────────────
