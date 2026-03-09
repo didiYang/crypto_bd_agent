@@ -282,14 +282,20 @@ export const appRouter = router({
       }),
 
     discover: protectedProcedure
-      .input(z.object({ source: z.enum(["coingecko", "coinmarketcap", "all"]).default("coingecko") }))
-      .mutation(async ({ ctx }) => {
+      .input(z.object({
+        source: z.enum(["coingecko", "coinmarketcap", "all"]).default("coingecko"),
+        daysBack: z.number().min(1).max(7).default(1),
+      }))
+      .mutation(async ({ ctx, input }) => {
         const userId = ctx.user.id;
         const cmcKey = await getSetting(userId, "cmc_api_key");
+        const { daysBack } = input;
+        // Scale limit with daysBack: 7 days needs more slots
+        const limit = Math.min(30 * daysBack, 200);
         let total = 0;
-        total += await discoverFromCoinGecko(30);
-        if (cmcKey) total += await discoverFromCoinMarketCap(cmcKey, 30);
-        return { discovered: total };
+        total += await discoverFromCoinGecko(limit, daysBack);
+        if (cmcKey) total += await discoverFromCoinMarketCap(cmcKey, limit, daysBack);
+        return { discovered: total, daysBack };
       }),
 
     enrichContacts: protectedProcedure

@@ -29,7 +29,7 @@ function isMemeProject(name: string, symbol: string, category?: string, tags?: s
 }
 
 // ─── CoinGecko Discovery ──────────────────────────────────────────────────────
-export async function discoverFromCoinGecko(limit = 50): Promise<number> {
+export async function discoverFromCoinGecko(limit = 50, daysBack = 1): Promise<number> {
   try {
     // Get recently added coins
     const response = await axios.get("https://api.coingecko.com/api/v3/coins/list/new", {
@@ -37,7 +37,11 @@ export async function discoverFromCoinGecko(limit = 50): Promise<number> {
       headers: { "Accept": "application/json" },
     });
 
-    const coins = response.data?.slice(0, limit) || [];
+    // Filter by time window: daysBack controls how far back we look
+    const cutoffTime = Date.now() - daysBack * 24 * 60 * 60 * 1000;
+    // CoinGecko /coins/list/new returns coins sorted by activation time desc
+    // We take up to `limit` but will also apply time-based filtering on detail fetch
+    const coins = response.data?.slice(0, Math.min(limit * daysBack, 200)) || [];
     let newCount = 0;
 
     for (const coin of coins) {
@@ -60,6 +64,20 @@ export async function discoverFromCoinGecko(limit = 50): Promise<number> {
         const d = detail.data;
         const categories = d.categories || [];
         const isMeme = isMemeProject(d.name, d.symbol, categories.join(","), categories);
+
+        // Time filter: skip coins added before the cutoff window
+        const activatedAt = d.genesis_date
+          ? new Date(d.genesis_date).getTime()
+          : (d.market_data?.atl_date?.usd ? new Date(d.market_data.atl_date.usd).getTime() : Date.now());
+        // Use market_data.last_updated as a proxy for listing time if genesis_date not available
+        const listingTime = d.market_data?.last_updated
+          ? new Date(d.market_data.last_updated).getTime()
+          : Date.now();
+        // Only skip if we have a reliable date AND it's clearly outside the window
+        // (genesis_date is often null for new coins, so we don't skip when date is unknown)
+        if (d.genesis_date && new Date(d.genesis_date).getTime() < cutoffTime) {
+          continue;
+        }
 
         await createProject({
           name: d.name,
@@ -116,20 +134,21 @@ export async function discoverFromCoinGecko(limit = 50): Promise<number> {
 }
 
 // ─── CoinMarketCap Discovery ──────────────────────────────────────────────────
-export async function discoverFromCoinMarketCap(apiKey?: string, limit = 50): Promise<number> {
+export async function discoverFromCoinMarketCap(apiKey?: string, limit = 50, daysBack = 1): Promise<number> {
   if (!apiKey) {
     console.warn("[CMC] No API key provided, skipping CMC discovery");
     return 0;
   }
 
   try {
+    const cutoffTime = Date.now() - daysBack * 24 * 60 * 60 * 1000;
     const response = await axios.get(
       "https://pro-api.coinmarketcap.com/v1/cryptocurrency/listings/latest",
       {
         timeout: 15000,
         headers: { "X-CMC_PRO_API_KEY": apiKey },
         params: {
-          limit,
+          limit: Math.min(limit * daysBack, 200),
           sort: "date_added",
           sort_dir: "desc",
           convert: "USD",
@@ -147,6 +166,11 @@ export async function discoverFromCoinMarketCap(apiKey?: string, limit = 50): Pr
 
         const tags = coin.tags || [];
         const isMeme = isMemeProject(coin.name, coin.symbol, coin.category, tags);
+
+        // Time filter: skip coins added before the cutoff window
+        if (coin.date_added && new Date(coin.date_added).getTime() < cutoffTime) {
+          continue;
+        }
 
         await createProject({
           name: coin.name,

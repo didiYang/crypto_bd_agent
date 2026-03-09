@@ -2,6 +2,15 @@ import { trpc } from "@/lib/trpc";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+  DropdownMenuSeparator,
+  DropdownMenuLabel,
+} from "@/components/ui/dropdown-menu";
+import { ChevronDown } from "lucide-react";
 import { toast } from "sonner";
 import { useState } from "react";
 import {
@@ -23,6 +32,13 @@ const COLORS = ["#6366f1", "#22d3ee", "#34d399", "#fbbf24", "#f87171", "#94a3b8"
 export default function Dashboard() {
   const [, navigate] = useLocation();
   const [discovering, setDiscovering] = useState(false);
+  const [scanDays, setScanDays] = useState(1);
+
+  const SCAN_PERIOD_LABELS: Record<number, string> = {
+    1: "过去24小时 / Last 24h",
+    3: "过去3天 / Last 3 days",
+    7: "过去一周 / Last 7 days",
+  };
 
   const { data: summary, refetch: refetchSummary } = trpc.analytics.summary.useQuery();
   const { data: today } = trpc.analytics.today.useQuery();
@@ -34,7 +50,12 @@ export default function Dashboard() {
 
   const discoverMutation = trpc.projects.discover.useMutation({
     onSuccess: (data) => {
-      toast.success(`发现 ${data.discovered} 个新项目 / Discovered ${data.discovered} new projects`);
+      const periodLabel = SCAN_PERIOD_LABELS[data.daysBack] || `Last ${data.daysBack} days`;
+      toast.success(
+        data.discovered > 0
+          ? `发现 ${data.discovered} 个新项目（${periodLabel}）`
+          : `未发现新项目，该时段内项目已全部入库（${periodLabel}）`
+      );
       refetchSummary();
     },
     onError: (e) => toast.error(e.message),
@@ -92,17 +113,44 @@ export default function Dashboard() {
           >
             {autoFollowUpMutation.isPending ? "处理中..." : `⏰ 自动跟进 (${followUpProjects?.length || 0})`}
           </Button>
-          <Button
-            size="sm"
-            onClick={() => {
-              setDiscovering(true);
-              discoverMutation.mutate({ source: "coingecko" });
-            }}
-            disabled={discovering}
-            className="bg-primary hover:bg-primary/90"
-          >
-            {discovering ? "扫描中..." : "🔍 扫描新项目"}
-          </Button>
+          <div className="flex items-center">
+            <Button
+              size="sm"
+              onClick={() => {
+                setDiscovering(true);
+                discoverMutation.mutate({ source: "coingecko", daysBack: scanDays });
+              }}
+              disabled={discovering}
+              className="bg-primary hover:bg-primary/90 rounded-r-none border-r border-primary/60"
+            >
+              {discovering ? "扫描中..." : `🔍 扫描新项目`}
+            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  size="sm"
+                  disabled={discovering}
+                  className="bg-primary hover:bg-primary/90 rounded-l-none px-2"
+                >
+                  <ChevronDown className="h-3.5 w-3.5" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end" className="w-52">
+                <DropdownMenuLabel className="text-xs text-muted-foreground">选择扫描时间范围</DropdownMenuLabel>
+                <DropdownMenuSeparator />
+                {([1, 3, 7] as const).map((days) => (
+                  <DropdownMenuItem
+                    key={days}
+                    onClick={() => setScanDays(days)}
+                    className={scanDays === days ? "bg-primary/20 text-primary font-medium" : ""}
+                  >
+                    {scanDays === days && <span className="mr-2">✓</span>}
+                    {SCAN_PERIOD_LABELS[days]}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
         </div>
       </div>
 
