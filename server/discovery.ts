@@ -29,7 +29,23 @@ function isMemeProject(name: string, symbol: string, category?: string, tags?: s
 }
 
 // ─── CoinGecko Discovery ──────────────────────────────────────────────────────
-export async function discoverFromCoinGecko(limit = 50, daysBack = 1): Promise<number> {
+export type DiscoveredProject = {
+  id: number;
+  name: string;
+  symbol: string;
+  isMeme: boolean;
+  logoUrl: string | null;
+  twitterUrl: string | null;
+  telegramUrl: string | null;
+  discordUrl: string | null;
+  officialEmail: string | null;
+  website: string | null;
+  marketCap: string | null;
+  source: string;
+  category: string | null;
+};
+
+export async function discoverFromCoinGecko(limit = 50, daysBack = 1): Promise<DiscoveredProject[]> {
   try {
     // Get recently added coins
     const response = await axios.get("https://api.coingecko.com/api/v3/coins/list/new", {
@@ -42,7 +58,7 @@ export async function discoverFromCoinGecko(limit = 50, daysBack = 1): Promise<n
     // CoinGecko /coins/list/new returns coins sorted by activation time desc
     // We take up to `limit` but will also apply time-based filtering on detail fetch
     const coins = response.data?.slice(0, Math.min(limit * daysBack, 200)) || [];
-    let newCount = 0;
+    const newProjects: DiscoveredProject[] = [];
 
     for (const coin of coins) {
       try {
@@ -79,7 +95,7 @@ export async function discoverFromCoinGecko(limit = 50, daysBack = 1): Promise<n
           continue;
         }
 
-        await createProject({
+        const saved = await createProject({
           name: d.name,
           symbol: d.symbol?.toUpperCase(),
           slug: d.id,
@@ -108,7 +124,21 @@ export async function discoverFromCoinGecko(limit = 50, daysBack = 1): Promise<n
           listedOnSourceAt: new Date(),
         });
 
-        newCount++;
+        newProjects.push({
+          id: saved.id,
+          name: saved.name,
+          symbol: saved.symbol,
+          isMeme: saved.isMeme,
+          logoUrl: saved.logoUrl ?? null,
+          twitterUrl: saved.twitterUrl ?? null,
+          telegramUrl: saved.telegramUrl ?? null,
+          discordUrl: saved.discordUrl ?? null,
+          officialEmail: saved.officialEmail ?? null,
+          website: saved.website ?? null,
+          marketCap: saved.marketCap ?? null,
+          source: saved.source,
+          category: saved.category ?? null,
+        });
         // Rate limit: 30 req/min for free tier
         await new Promise((r) => setTimeout(r, 2000));
       } catch (err: any) {
@@ -117,27 +147,27 @@ export async function discoverFromCoinGecko(limit = 50, daysBack = 1): Promise<n
     }
 
     // Update analytics
-    if (newCount > 0) {
+    if (newProjects.length > 0) {
       const today = new Date().toISOString().slice(0, 10);
       const row = await getOrCreateAnalytics(today);
       await updateAnalytics(today, {
-        projectsDiscovered: (row.projectsDiscovered || 0) + newCount,
+        projectsDiscovered: (row.projectsDiscovered || 0) + newProjects.length,
       });
     }
 
-    console.log(`[CoinGecko] Discovered ${newCount} new projects`);
-    return newCount;
+    console.log(`[CoinGecko] Discovered ${newProjects.length} new projects`);
+    return newProjects;
   } catch (err: any) {
     console.error("[CoinGecko] Discovery failed:", err.message);
-    return 0;
+    return [];
   }
 }
 
 // ─── CoinMarketCap Discovery ──────────────────────────────────────────────────
-export async function discoverFromCoinMarketCap(apiKey?: string, limit = 50, daysBack = 1): Promise<number> {
+export async function discoverFromCoinMarketCap(apiKey?: string, limit = 50, daysBack = 1): Promise<DiscoveredProject[]> {
   if (!apiKey) {
     console.warn("[CMC] No API key provided, skipping CMC discovery");
-    return 0;
+    return [];
   }
 
   try {
@@ -157,7 +187,7 @@ export async function discoverFromCoinMarketCap(apiKey?: string, limit = 50, day
     );
 
     const coins = response.data?.data || [];
-    let newCount = 0;
+    const newProjects: DiscoveredProject[] = [];
 
     for (const coin of coins) {
       try {
@@ -172,7 +202,7 @@ export async function discoverFromCoinMarketCap(apiKey?: string, limit = 50, day
           continue;
         }
 
-        await createProject({
+        const saved = await createProject({
           name: coin.name,
           symbol: coin.symbol,
           slug: coin.slug,
@@ -189,25 +219,39 @@ export async function discoverFromCoinMarketCap(apiKey?: string, limit = 50, day
           listedOnSourceAt: coin.date_added ? new Date(coin.date_added) : new Date(),
         });
 
-        newCount++;
+        newProjects.push({
+          id: saved.id,
+          name: saved.name,
+          symbol: saved.symbol,
+          isMeme: saved.isMeme,
+          logoUrl: saved.logoUrl ?? null,
+          twitterUrl: saved.twitterUrl ?? null,
+          telegramUrl: saved.telegramUrl ?? null,
+          discordUrl: saved.discordUrl ?? null,
+          officialEmail: saved.officialEmail ?? null,
+          website: saved.website ?? null,
+          marketCap: saved.marketCap ?? null,
+          source: saved.source,
+          category: saved.category ?? null,
+        });
       } catch (err: any) {
         console.warn(`[CMC] Failed to save coin ${coin.id}:`, err.message);
       }
     }
 
-    if (newCount > 0) {
+    if (newProjects.length > 0) {
       const today = new Date().toISOString().slice(0, 10);
       const row = await getOrCreateAnalytics(today);
       await updateAnalytics(today, {
-        projectsDiscovered: (row.projectsDiscovered || 0) + newCount,
+        projectsDiscovered: (row.projectsDiscovered || 0) + newProjects.length,
       });
     }
 
-    console.log(`[CMC] Discovered ${newCount} new projects`);
-    return newCount;
+    console.log(`[CMC] Discovered ${newProjects.length} new projects`);
+    return newProjects;
   } catch (err: any) {
     console.error("[CMC] Discovery failed:", err.message);
-    return 0;
+    return [];
   }
 }
 

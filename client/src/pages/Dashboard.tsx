@@ -13,6 +13,7 @@ import {
 import { ChevronDown } from "lucide-react";
 import { toast } from "sonner";
 import { useState } from "react";
+import ScanResultDialog, { type DiscoveredProject } from "@/components/ScanResultDialog";
 import {
   AreaChart,
   Area,
@@ -33,6 +34,9 @@ export default function Dashboard() {
   const [, navigate] = useLocation();
   const [discovering, setDiscovering] = useState(false);
   const [scanDays, setScanDays] = useState(1);
+  const [scanDialogOpen, setScanDialogOpen] = useState(false);
+  const [scanResults, setScanResults] = useState<DiscoveredProject[]>([]);
+  const [lastScanDays, setLastScanDays] = useState(1);
 
   const SCAN_PERIOD_LABELS: Record<number, string> = {
     1: "过去24小时 / Last 24h",
@@ -50,13 +54,15 @@ export default function Dashboard() {
 
   const discoverMutation = trpc.projects.discover.useMutation({
     onSuccess: (data) => {
-      const periodLabel = SCAN_PERIOD_LABELS[data.daysBack] || `Last ${data.daysBack} days`;
-      toast.success(
-        data.discovered > 0
-          ? `发现 ${data.discovered} 个新项目（${periodLabel}）`
-          : `未发现新项目，该时段内项目已全部入库（${periodLabel}）`
-      );
       refetchSummary();
+      if (data.discovered > 0) {
+        setScanResults(data.projects);
+        setLastScanDays(data.daysBack);
+        setScanDialogOpen(true);
+      } else {
+        const periodLabel = SCAN_PERIOD_LABELS[data.daysBack] || `Last ${data.daysBack} days`;
+        toast.info(`未发现新项目，该时段内项目已全部入库（${periodLabel}）`);
+      }
     },
     onError: (e) => toast.error(e.message),
     onSettled: () => setDiscovering(false),
@@ -304,6 +310,14 @@ export default function Dashboard() {
           </CardContent>
         </Card>
       )}
+
+      {/* Scan Result Dialog */}
+      <ScanResultDialog
+        open={scanDialogOpen}
+        onClose={() => setScanDialogOpen(false)}
+        projects={scanResults}
+        daysBack={lastScanDays}
+      />
     </div>
   );
 }

@@ -292,10 +292,10 @@ export const appRouter = router({
         const { daysBack } = input;
         // Scale limit with daysBack: 7 days needs more slots
         const limit = Math.min(30 * daysBack, 200);
-        let total = 0;
-        total += await discoverFromCoinGecko(limit, daysBack);
-        if (cmcKey) total += await discoverFromCoinMarketCap(cmcKey, limit, daysBack);
-        return { discovered: total, daysBack };
+        const geckoProjects = await discoverFromCoinGecko(limit, daysBack);
+        const cmcProjects = cmcKey ? await discoverFromCoinMarketCap(cmcKey, limit, daysBack) : [];
+        const newProjects = [...geckoProjects, ...cmcProjects];
+        return { discovered: newProjects.length, daysBack, projects: newProjects };
       }),
 
     enrichContacts: protectedProcedure
